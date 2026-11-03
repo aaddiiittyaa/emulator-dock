@@ -1,0 +1,230 @@
+{
+  "name": "emulator-dock",
+  "displayName": "Emulator Dock for Android",
+  "description": "Run the Android emulator inside VS Code as a native, dockable panel. Code and app preview side by side, no window switching.",
+  "version": "0.1.2",
+  "publisher": "emulator-dock",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Testing"
+  ],
+  "keywords": [
+    "android",
+    "emulator",
+    "avd",
+    "flutter",
+    "react native",
+    "mobile"
+  ],
+  "icon": "media/icon.png",
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onWebviewPanel:emulatorDock.panel",
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "emulatorDock",
+          "title": "Android Emulator",
+          "icon": "media/phone.svg"
+        }
+      ]
+    },
+    "views": {
+      "emulatorDock": [
+        {
+          "type": "webview",
+          "id": "emulatorDock.view",
+          "name": "Emulator",
+          "icon": "media/phone.svg",
+          "contextualTitle": "Android Emulator"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "emulatorDock.launchAvd",
+        "title": "Launch Virtual Device\u2026",
+        "category": "Android Emulator",
+        "icon": "$(play)"
+      },
+      {
+        "command": "emulatorDock.openInEditor",
+        "title": "Open Emulator Beside Editor",
+        "category": "Android Emulator",
+        "icon": "$(split-horizontal)"
+      },
+      {
+        "command": "emulatorDock.refresh",
+        "title": "Refresh Devices",
+        "category": "Android Emulator",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "emulatorDock.stopEmulator",
+        "title": "Stop Emulator\u2026",
+        "category": "Android Emulator",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "emulatorDock.screenshot",
+        "title": "Take Screenshot",
+        "category": "Android Emulator",
+        "icon": "$(device-camera)"
+      },
+      {
+        "command": "emulatorDock.toggleFullscreen",
+        "title": "Toggle Fullscreen",
+        "category": "Android Emulator",
+        "icon": "$(screen-full)"
+      },
+      {
+        "command": "emulatorDock.view.toggleFullscreen",
+        "title": "Toggle Fullscreen",
+        "category": "Android Emulator",
+        "icon": "$(screen-full)"
+      },
+      {
+        "command": "emulatorDock.panel.toggleFullscreen",
+        "title": "Toggle Fullscreen",
+        "category": "Android Emulator",
+        "icon": "$(screen-full)"
+      },
+      {
+        "command": "emulatorDock.showLogs",
+        "title": "Show Logs",
+        "category": "Android Emulator"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "emulatorDock.launchAvd",
+          "when": "view == emulatorDock.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "emulatorDock.openInEditor",
+          "when": "view == emulatorDock.view",
+          "group": "navigation@2"
+        },
+        {
+          "command": "emulatorDock.refresh",
+          "when": "view == emulatorDock.view",
+          "group": "navigation@3"
+        },
+        {
+          "command": "emulatorDock.view.toggleFullscreen",
+          "when": "view == emulatorDock.view",
+          "group": "navigation@4"
+        },
+        {
+          "command": "emulatorDock.screenshot",
+          "when": "view == emulatorDock.view",
+          "group": "1_device@1"
+        },
+        {
+          "command": "emulatorDock.stopEmulator",
+          "when": "view == emulatorDock.view",
+          "group": "1_device@2"
+        },
+        {
+          "command": "emulatorDock.showLogs",
+          "when": "view == emulatorDock.view",
+          "group": "2_misc@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "emulatorDock.panel.toggleFullscreen",
+          "when": "activeWebviewPanelId == 'emulatorDock.panel'",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "emulatorDock.view.toggleFullscreen",
+          "when": "false"
+        },
+        {
+          "command": "emulatorDock.panel.toggleFullscreen",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Android Emulator",
+      "properties": {
+        "emulatorDock.sdkPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the Android SDK. Leave empty to auto-detect from `ANDROID_HOME`, `ANDROID_SDK_ROOT`, or the default install location."
+        },
+        "emulatorDock.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically show a running emulator when the panel opens."
+        },
+        "emulatorDock.screenQuality": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "performance"
+          ],
+          "default": "auto",
+          "enumDescriptions": [
+            "Stream at the panel's full pixel density (sharpest on high-DPI displays).",
+            "Stream at half density on high-DPI displays: about 4x less data, smoother on slower machines."
+          ],
+          "description": "Resolution used to stream the emulator screen into the panel."
+        },
+        "emulatorDock.launch.hideStandaloneWindow": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide the emulator's own window when launching from VS Code, so it only appears docked inside the editor."
+        },
+        "emulatorDock.launch.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra command-line arguments passed to the emulator on launch, for example `[\"-no-snapshot-load\"]`."
+        },
+        "emulatorDock.stopOnExit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Shut down emulators launched from VS Code once VS Code is closed (they stop themselves about 2 minutes after the last window closes). Reloading the window keeps them running. Emulators started elsewhere are never stopped."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build -- --production",
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.7",
+    "@grpc/proto-loader": "^0.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "1.85.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.27.7",
+    "typescript": "^5.9.3"
+  }
+}
