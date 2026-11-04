@@ -3,7 +3,7 @@
   "displayName": "Emulator Dock for Android",
   "description": "Run the Android emulator inside VS Code as a native, dockable panel. Code and app preview side by side, no window switching.",
   "version": "0.1.2",
-  "publisher": "emulator-dock",
+  "publisher": "aaddiiittyaa",
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
