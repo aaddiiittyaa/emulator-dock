@@ -25,6 +25,31 @@ export interface TouchPoint {
   pressure: number;
 }
 
+/**
+ * A live connection to one device, as driven by a view controller. Implemented over the
+ * emulator's gRPC API (EmulatorSession) and over adb for physical devices (AdbSession).
+ * Coordinates are normalized (0..1) on the image as displayed.
+ */
+export interface DeviceSession {
+  readonly displaySize: { width: number; height: number };
+  start(): Promise<void>;
+  setActive(active: boolean): void;
+  setViewport(width: number, height: number): void;
+  resync(): void;
+  frameAck(): void;
+  pointer(nx: number, ny: number, buttons: number, rotation?: SkinRotation): void;
+  touch(points: TouchPoint[], rotation?: SkinRotation): void;
+  wheel(dx: number, dy: number): void;
+  key(key: string, eventType?: 'keydown' | 'keyup' | 'keypress'): void;
+  text(text: string): void;
+  ctrlCombo(letter: string): void;
+  paste(text: string): Promise<void>;
+  copyFromDevice(cut: boolean): Promise<string>;
+  rotate(direction: 1 | -1): Promise<void>;
+  screenshotPng(): Promise<Buffer>;
+  dispose(): void;
+}
+
 const ROTATION_QUADRANT: Record<SkinRotation, number> = {
   PORTRAIT: 0,
   LANDSCAPE: 1,
@@ -44,7 +69,7 @@ const clamp01 = (v: number) => (Number.isFinite(v) ? Math.min(1, Math.max(0, v))
  * forwards input. Frames use ack-based flow control so the panel always shows the newest
  * frame and latency never builds up when rendering falls behind.
  */
-export class EmulatorSession {
+export class EmulatorSession implements DeviceSession {
   readonly client: EmulatorClient;
   private display = { width: 1080, height: 1920 };
   private rotation: SkinRotation = 'PORTRAIT';

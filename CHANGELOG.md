@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Physical devices: every device listed by `adb devices` (USB or wireless debugging) now appears under **Connected devices**. Pick one to mirror its screen and control it with touch, keyboard, hardware buttons, and rotation. Devices that need authorization or are offline are listed with a hint.
+- Emulators that run without gRPC are also reachable through adb.
+
 ## 0.1.2
 
 - Reloading the window no longer stops the emulator. Panels reattach to the same device, and fullscreen is remembered.

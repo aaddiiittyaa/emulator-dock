@@ -137,15 +137,41 @@ export function adbBinary(sdk: string): string {
 }
 
 /**
+ * Finds adb: the SDK's platform-tools first (the same adb Android Studio and Flutter use, so
+ * the adb server isn't restarted over a version mismatch), then any SDK location, then PATH.
+ */
+export function resolveAdbPath(sdk: string | undefined, configured: string | undefined): string | undefined {
+  const roots = [
+    sdk,
+    configured?.trim() ? expandHome(configured.trim()) : undefined,
+    process.env.ANDROID_HOME,
+    process.env.ANDROID_SDK_ROOT,
+    ...defaultSdkLocations(),
+  ];
+  for (const root of roots) {
+    if (root && fs.existsSync(adbBinary(root))) {
+      return adbBinary(root);
+    }
+  }
+  for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+    const candidate = dir && path.join(dir, isWindows ? 'adb.exe' : 'adb');
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Reads the screen's rounded-corner radius (native pixels) from Android itself. SystemUI
  * paints these corners black into every frame, so the panel must clip to the same radius.
  * Resolves to the radius, `null` when the device reports no rounded corners (or predates
  * Android 12), or `undefined` when adb couldn't answer yet (device still booting, no adb).
  */
-export function readCornerRadius(sdk: string, serial: string): Promise<number | null | undefined> {
+export function readCornerRadius(adb: string, serial: string): Promise<number | null | undefined> {
   return new Promise((resolve) => {
     execFile(
-      adbBinary(sdk),
+      adb,
       ['-s', serial, 'shell', 'dumpsys', 'display'],
       { timeout: 8000, maxBuffer: 16 * 1024 * 1024 },
       (error, stdout) => {

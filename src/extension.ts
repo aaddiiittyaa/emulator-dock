@@ -9,6 +9,13 @@ let registry: DeviceRegistry | undefined;
 let viewController: EmulatorViewController | undefined;
 const panelControllers = new Map<vscode.WebviewPanel, EmulatorViewController>();
 
+/** What a webview persists: the device key (older versions saved only an emulator pid). */
+type SavedState = { key?: string; pid?: number } | undefined;
+
+function savedKey(state: SavedState): string | undefined {
+  return state?.key ?? (typeof state?.pid === 'number' ? `run:${state.pid}` : undefined);
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const log = vscode.window.createOutputChannel('Android Emulator', { log: true });
   registry = new DeviceRegistry(context, log);
@@ -17,9 +24,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const iconPath = vscode.Uri.joinPath(context.extensionUri, 'media', 'phone.svg');
 
-  const attachPanel = (panel: vscode.WebviewPanel, pid?: number) => {
+  const attachPanel = (panel: vscode.WebviewPanel, key?: string) => {
     panel.iconPath = iconPath;
-    const controller = new EmulatorViewController(panel.webview, context, reg, log, 'editor', pid);
+    const controller = new EmulatorViewController(panel.webview, context, reg, log, 'editor', key);
     panelControllers.set(panel, controller);
     panel.onDidChangeViewState(() => controller.setVisible(panel.visible));
     panel.onDidDispose(() => {
@@ -37,8 +44,7 @@ export function activate(context: vscode.ExtensionContext): void {
       {
         resolveWebviewView(view, resolveContext) {
           // After a window reload, reattach to the device this view was showing.
-          const saved = resolveContext?.state as { pid?: number } | undefined;
-          const controller = new EmulatorViewController(view.webview, context, reg, log, 'sidebar', saved?.pid);
+          const controller = new EmulatorViewController(view.webview, context, reg, log, 'sidebar', savedKey(resolveContext?.state as SavedState));
           viewController = controller;
           view.onDidChangeVisibility(() => controller.setVisible(view.visible));
           view.onDidDispose(() => {
@@ -53,8 +59,8 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
 
     vscode.window.registerWebviewPanelSerializer(PANEL_TYPE, {
-      async deserializeWebviewPanel(panel, state: { pid?: number } | undefined) {
-        attachPanel(panel, state?.pid);
+      async deserializeWebviewPanel(panel, state: SavedState) {
+        attachPanel(panel, savedKey(state));
       },
     }),
 
@@ -65,7 +71,7 @@ export function activate(context: vscode.ExtensionContext): void {
         { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
         { retainContextWhenHidden: true },
       );
-      attachPanel(panel, activeController()?.connectedEmulator?.pid);
+      attachPanel(panel, activeController()?.connectedKey);
     }),
 
     vscode.commands.registerCommand('emulatorDock.launchAvd', async () => {
@@ -109,7 +115,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     vscode.commands.registerCommand('emulatorDock.stopEmulator', async () => {
       const controller = activeController();
-      if (controller?.connectedEmulator) {
+      if (controller?.canStop) {
         await controller.stop();
         return;
       }

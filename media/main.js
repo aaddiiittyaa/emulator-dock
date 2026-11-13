@@ -28,10 +28,11 @@
   let shownKey = '';
   const saved = vscode.getState() || {};
   let fullscreen = !!saved.fullscreen;
-  let persistedPid = saved.pid;
+  /** Device to reattach to after a reload: `run:<pid>` or `adb:<serial>` (older state stored only a pid). */
+  let persistedKey = saved.key ?? (typeof saved.pid === 'number' ? `run:${saved.pid}` : undefined);
 
   function persist() {
-    vscode.setState({ pid: persistedPid, fullscreen });
+    vscode.setState({ key: persistedKey, fullscreen });
   }
 
   /** Space between the screen and the panel edge; none in fullscreen. */
@@ -81,7 +82,7 @@
       px[i] = 0xff000000 | (src[j + 2] << 16) | (src[j + 1] << 8) | src[j];
     }
     ctx.putImageData(imageData, 0, 0);
-    if (typeof state.cornerRatio !== 'number') {
+    if (typeof state.cornerRatio !== 'number' && state.deviceKind === 'emulator') {
       estimateCorner(src, width, height);
     }
     frameRotation = frame.rotation;
@@ -151,6 +152,10 @@
   function cornerRatio() {
     if (typeof state.cornerRatio === 'number') {
       return state.cornerRatio;
+    }
+    if (state.deviceKind === 'adb') {
+      // Mirrored device frames have no painted-in corners to estimate from; wait for the device to report.
+      return 0;
     }
     if (Number.isFinite(estimatedCorner)) {
       return estimatedCorner;
@@ -475,26 +480,32 @@
   const PHONE_ICON =
     '<svg class="hero" viewBox="0 0 48 48" aria-hidden="true"><rect x="13" y="4" width="22" height="40" rx="4"/><path d="M21 38h6"/></svg>';
 
+  /** @param {string} kind */
+  function devicesOf(kind) {
+    return state.devices.filter((/** @type {any} */ d) => d.kind === kind);
+  }
+
+  /** @param {any} d */
+  function deviceOption(d) {
+    const note = d.state === 'launching' ? 'starting…' : d.note ?? d.serial;
+    const disabled = d.state === 'launching' || d.state === 'unavailable';
+    return `<option value="${esc(d.key)}"${d.key === state.selectedKey ? ' selected' : ''}${disabled ? ' disabled' : ''}>${esc(d.label)}${note ? ` (${esc(note)})` : ''}</option>`;
+  }
+
   function renderDeviceSelect() {
-    const running = state.devices.filter((/** @type {any} */ d) => d.state === 'running');
-    const others = state.devices.filter((/** @type {any} */ d) => d.state !== 'running');
     let html = '';
     if (!state.devices.some((/** @type {any} */ d) => d.key === state.selectedKey)) {
       html += `<option value="" selected disabled>${state.devices.length ? 'Select a device…' : 'No devices'}</option>`;
     }
-    if (running.length) {
-      html += '<optgroup label="Running">';
-      for (const d of running) {
-        html += `<option value="${esc(d.key)}"${d.key === state.selectedKey ? ' selected' : ''}>${esc(d.label)}${d.serial ? ` (${esc(d.serial)})` : ''}</option>`;
+    for (const [kind, label] of [
+      ['emulator', 'Running'],
+      ['adb', 'Connected devices'],
+      ['avd', 'Launch'],
+    ]) {
+      const group = devicesOf(kind);
+      if (group.length) {
+        html += `<optgroup label="${label}">${group.map(deviceOption).join('')}</optgroup>`;
       }
-      html += '</optgroup>';
-    }
-    if (others.length) {
-      html += '<optgroup label="Launch">';
-      for (const d of others) {
-        html += `<option value="${esc(d.key)}"${d.state === 'launching' ? ' disabled' : ''}>${esc(d.label)}${d.state === 'launching' ? ' (starting…)' : ''}</option>`;
-      }
-      html += '</optgroup>';
     }
     deviceSelect.innerHTML = html;
     deviceSelect.disabled = state.devices.length === 0;
@@ -531,17 +542,24 @@
         <p class="title">${label}</p>
         ${s === 'launching' ? '<p class="desc">A cold boot can take a minute. The screen appears here as soon as the device starts drawing.</p>' : ''}`;
     } else {
-      const running = state.devices.filter((/** @type {any} */ d) => d.state === 'running');
-      const avds = state.devices.filter((/** @type {any} */ d) => d.state !== 'running');
+      const running = devicesOf('emulator');
+      const connectedDevices = devicesOf('adb');
+      const avds = devicesOf('avd');
       const isError = s === 'error';
       html = `${PHONE_ICON}
-        <p class="title">${isError ? 'Connection problem' : running.length ? 'Choose a device' : 'No emulator running'}</p>
+        <p class="title">${isError ? 'Connection problem' : running.length || connectedDevices.length ? 'Choose a device' : 'No emulator running'}</p>
         ${state.message ? `<p class="desc${isError ? ' error' : ''}">${esc(state.message)}</p>` : ''}`;
-      if (running.length || avds.length) {
+      if (state.devices.length) {
         html += '<ul class="avd-list">';
         for (const d of running) {
           html += `<li><span class="avd-name"><span class="dot running" aria-hidden="true"></span>${esc(d.label)}</span>
             <button class="btn small" data-select="${esc(d.key)}">Show</button></li>`;
+        }
+        for (const d of connectedDevices) {
+          const ready = d.state === 'running';
+          const note = d.note ? `<span class="avd-note">${esc(d.note)}</span>` : '';
+          html += `<li${ready ? '' : ' class="unavailable"'}><span class="avd-name"><span class="dot${ready ? ' running' : ''}" aria-hidden="true"></span><span class="avd-label">${esc(d.label)}</span>${ready ? note : ''}</span>
+            ${ready ? `<button class="btn small" data-select="${esc(d.key)}">Show</button>` : note}</li>`;
         }
         for (const d of avds) {
           const launching = d.state === 'launching';
@@ -550,7 +568,7 @@
         }
         html += '</ul>';
       } else {
-        html += `<p class="desc">No virtual devices found. Create one in Android Studio's Device Manager, or run <code>avdmanager create avd</code>.</p>`;
+        html += `<p class="desc">No devices found. Create a virtual device in Android Studio's Device Manager (or run <code>avdmanager create avd</code>), or connect a phone with USB debugging turned on.</p>`;
       }
       html += `<div class="row">${isError ? '<button class="btn" data-command="retry">Retry</button>' : ''}
         <button class="btn secondary" data-command="${isError ? 'showLogs' : 'refresh'}">${isError ? 'Show Logs' : 'Refresh'}</button></div>`;
@@ -578,6 +596,9 @@
     document.querySelectorAll('[data-needs-device]').forEach((el) => {
       /** @type {HTMLButtonElement} */ (el).disabled = !connected;
     });
+    const stopButton = /** @type {HTMLButtonElement} */ (document.querySelector('[data-command="stop"]'));
+    stopButton.disabled = !connected || !next.canStop;
+    stopButton.title = connected && !next.canStop ? 'Physical devices can’t be stopped from here' : 'Stop emulator';
     if (connected && (!wasConnected || qualityChanged)) {
       // Frames resume once the extension knows the panel size.
       lastViewport = '';
@@ -587,8 +608,7 @@
       screenWrap.hidden = true;
       activePointer = undefined;
     }
-    const selected = state.devices.find((/** @type {any} */ d) => d.key === state.selectedKey);
-    persistedPid = selected?.pid;
+    persistedKey = state.devices.some((/** @type {any} */ d) => d.key === state.selectedKey) ? state.selectedKey : undefined;
     persist();
     layoutCanvas();
   }

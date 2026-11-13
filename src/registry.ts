@@ -1,19 +1,33 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { adbExec, AdbDevice, AdbDeviceInfo, AdbDeviceTracker, isEmulatorSerial, isNetworkSerial, readDeviceInfo } from './adb';
 import { discoverRunningEmulators, registrationDirectory, RunningEmulator } from './discovery';
 import { EmulatorClient } from './emulatorClient';
-import { AvdInfo, launchEmulator, listAvds, resolveSdkPath, tailFile } from './sdk';
+import { AvdInfo, launchEmulator, listAvds, resolveAdbPath, resolveSdkPath, tailFile } from './sdk';
 
 export interface DeviceEntry {
-  /** `run:<pid>` for a running emulator, `avd:<id>` for one that can be launched. */
+  /** `run:<pid>` for a running emulator, `adb:<serial>` for an adb device, `avd:<id>` for an AVD that can be launched. */
   key: string;
   label: string;
-  avdId: string;
-  state: 'running' | 'launching' | 'stopped';
+  kind: 'emulator' | 'adb' | 'avd';
+  avdId?: string;
+  /** `unavailable`: an adb device that is connected but not usable yet (unauthorized, offline...). */
+  state: 'running' | 'launching' | 'stopped' | 'unavailable';
   pid?: number;
   serial?: string;
+  /** Short qualifier shown after the label: "USB", "Wi-Fi", or why the device can't be used. */
+  note?: string;
 }
+
+/** What to tell the user about adb device states other than "device". */
+const ADB_STATE_NOTES: Record<string, string> = {
+  unauthorized: 'allow USB debugging on the device',
+  authorizing: 'waiting for authorization',
+  connecting: 'connecting',
+  offline: 'offline, reconnect the cable',
+  'no permissions': 'no permission to access it (check udev rules)',
+};
 
 interface LaunchRecord {
   startedAt: number;
@@ -41,6 +55,14 @@ export class DeviceRegistry implements vscode.Disposable {
 
   /** True once the first scan for running emulators has finished. */
   ready = false;
+
+  adbPath: string | undefined;
+  /** Devices reported by `adb track-devices`, in every state. */
+  adbDevices: AdbDevice[] = [];
+  private adbReported = false;
+  private adbWanted = false;
+  private tracker: AdbDeviceTracker | undefined;
+  private readonly adbInfo = new Map<string, AdbDeviceInfo | 'pending' | 'failed'>();
 
   private readonly launching = new Map<string, LaunchRecord>();
   private readonly heartbeatClients = new Map<number, EmulatorClient>();
@@ -84,6 +106,8 @@ export class DeviceRegistry implements vscode.Disposable {
 
   async refresh(): Promise<void> {
     this.sdkPath = resolveSdkPath(this.config.get<string>('sdkPath'));
+    this.adbPath = resolveAdbPath(this.sdkPath, this.config.get<string>('sdkPath'));
+    this.ensureTracker();
     // Running emulators first (fast) so panels reconnect immediately after a reload;
     // the AVD list (which shells out to the emulator binary) follows.
     await this.pollRunning(true);
@@ -156,6 +180,102 @@ export class DeviceRegistry implements vscode.Disposable {
     }
   }
 
+  // ---- adb devices ------------------------------------------------------------------
+
+  /**
+   * Starts following adb devices. Called once a view opens rather than on activation, so
+   * VS Code doesn't start an adb server for users who never open the panel.
+   */
+  startAdbTracking(): void {
+    this.adbWanted = true;
+    this.ensureTracker();
+  }
+
+  /** True once adb has reported its device list (or there is no adb to ask). */
+  get adbSettled(): boolean {
+    return this.adbReported || !this.adbPath;
+  }
+
+  private ensureTracker(): void {
+    if (!this.adbWanted || this.tracker?.adb === this.adbPath) {
+      return;
+    }
+    this.tracker?.dispose();
+    this.tracker = undefined;
+    this.adbDevices = [];
+    this.adbReported = false;
+    if (this.adbPath) {
+      this.log.info(`adb: ${this.adbPath}`);
+      this.tracker = new AdbDeviceTracker(this.adbPath, (devices) => this.onAdbDevices(devices), (m) => this.log.info(m));
+    }
+  }
+
+  private onAdbDevices(devices: AdbDevice[]): void {
+    const describe = (list: AdbDevice[]) => new Set(list.map((d) => `${d.serial} (${d.state})`));
+    const before = describe(this.adbDevices);
+    const after = describe(devices);
+    for (const d of after) {
+      if (!before.has(d)) {
+        this.log.info(`adb device: ${d}`);
+      }
+    }
+    this.adbDevices = devices;
+    this.adbReported = true;
+    for (const serial of [...this.adbInfo.keys()]) {
+      if (!devices.some((d) => d.serial === serial && d.state === 'device')) {
+        this.adbInfo.delete(serial);
+      }
+    }
+    const adb = this.adbPath;
+    for (const device of devices) {
+      if (adb && device.state === 'device' && !this.adbInfo.has(device.serial)) {
+        this.adbInfo.set(device.serial, 'pending');
+        void readDeviceInfo(adb, device.serial).then((info) => {
+          if (this.adbInfo.get(device.serial) === 'pending') {
+            this.adbInfo.set(device.serial, info ?? 'failed');
+            this.changeEmitter.fire();
+          }
+        });
+      }
+    }
+    this.changeEmitter.fire();
+  }
+
+  /** emulator-<port> serials of emulators that are already listed through gRPC. */
+  private isGrpcEmulator(serial: string): boolean {
+    return this.running.some((r) => r.serialPort && `emulator-${r.serialPort}` === serial);
+  }
+
+  /** Whether `key` (`run:<pid>` or `adb:<serial>`) names a device that can be shown right now. */
+  isAvailable(key: string): boolean {
+    if (key.startsWith('run:')) {
+      return this.running.some((r) => r.pid === Number(key.slice(4)));
+    }
+    if (key.startsWith('adb:')) {
+      const serial = key.slice(4);
+      return !this.isGrpcEmulator(serial) && this.adbDevices.some((d) => d.serial === serial && d.state === 'device');
+    }
+    return false;
+  }
+
+  adbLabel(serial: string): string {
+    const info = this.adbInfo.get(serial);
+    if (typeof info === 'object') {
+      return info.name;
+    }
+    const model = this.adbDevices.find((d) => d.serial === serial)?.model;
+    return model ? model.replace(/_/g, ' ') : serial;
+  }
+
+  /** Stops an emulator that is only reachable through adb (no gRPC). */
+  async stopAdbEmulator(serial: string): Promise<void> {
+    if (!this.adbPath || !isEmulatorSerial(serial)) {
+      return;
+    }
+    this.log.info(`Stopping ${serial} through adb`);
+    await adbExec(this.adbPath, ['-s', serial, 'emu', 'kill'], 5000);
+  }
+
   isLaunching(avdId: string): boolean {
     return this.launching.has(avdId);
   }
@@ -168,16 +288,41 @@ export class DeviceRegistry implements vscode.Disposable {
     const entries: DeviceEntry[] = this.running.map((r) => ({
       key: `run:${r.pid}`,
       label: r.avdName,
+      kind: 'emulator',
       avdId: r.avdId,
       state: 'running',
       pid: r.pid,
       serial: r.serialPort ? `emulator-${r.serialPort}` : undefined,
     }));
+    for (const device of this.adbDevices) {
+      const ready = device.state === 'device';
+      // A booting emulator shows up in adb as "offline" before it registers its gRPC port.
+      if (this.isGrpcEmulator(device.serial) || (isEmulatorSerial(device.serial) && !ready)) {
+        continue;
+      }
+      entries.push({
+        key: `adb:${device.serial}`,
+        label: this.adbLabel(device.serial),
+        kind: 'adb',
+        state: ready ? 'running' : 'unavailable',
+        serial: device.serial,
+        note: !ready
+          ? ADB_STATE_NOTES[device.state] ?? device.state
+          : isEmulatorSerial(device.serial)
+            ? device.serial
+            : device.usb
+              ? 'USB'
+              : isNetworkSerial(device.serial)
+                ? 'Wi-Fi'
+                : undefined,
+      });
+    }
     for (const avd of this.avds) {
       if (!this.running.some((r) => r.avdId === avd.id)) {
         entries.push({
           key: `avd:${avd.id}`,
           label: avd.displayName,
+          kind: 'avd',
           avdId: avd.id,
           state: this.launching.has(avd.id) ? 'launching' : 'stopped',
         });
@@ -250,6 +395,7 @@ export class DeviceRegistry implements vscode.Disposable {
     clearInterval(this.timer);
     this.heartbeatClients.forEach((c) => c.close());
     this.heartbeatClients.clear();
+    this.tracker?.dispose();
     this.watcher?.close();
     this.changeEmitter.dispose();
     this.disposables.forEach((d) => d.dispose());

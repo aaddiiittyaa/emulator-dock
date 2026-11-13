@@ -2,10 +2,13 @@ import * as crypto from 'crypto';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { isEmulatorSerial } from './adb';
+import { AdbSession } from './adbSession';
+import type { RunningEmulator } from './discovery';
 import type { SkinRotation } from './emulatorClient';
 import { DeviceRegistry, protoPath } from './registry';
 import { readCornerRadius } from './sdk';
-import { EmulatorSession, TouchPoint } from './session';
+import { DeviceSession, EmulatorSession, SessionSink, TouchPoint } from './session';
 
 type Status = 'noSdk' | 'idle' | 'launching' | 'connecting' | 'connected' | 'error';
 
@@ -26,8 +29,19 @@ const ALLOWED_KEYS = new Set([
 
 let lastActive: EmulatorViewController | undefined;
 const controllers = new Set<EmulatorViewController>();
-/** Screen corner radius as a fraction of the display's short side, per emulator pid. */
-const cornerRatios = new Map<number, number | null>();
+/** Screen corner radius as a fraction of the display's short side, per device key. */
+const cornerRatios = new Map<string, number | null>();
+
+/** The device a webview is showing. */
+interface Target {
+  /** Device entry key: `run:<pid>` (gRPC emulator) or `adb:<serial>`. */
+  key: string;
+  name: string;
+  kind: 'emulator' | 'adb';
+  /** adb serial, when known (emulators have one too). */
+  serial?: string;
+  emulator?: RunningEmulator;
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -43,11 +57,12 @@ export function activeController(): EmulatorViewController | undefined {
  * owns the streaming session for whichever emulator that webview shows.
  */
 export class EmulatorViewController implements vscode.Disposable {
-  private session: EmulatorSession | undefined;
+  private session: DeviceSession | undefined;
+  private target: Target | undefined;
   private status: Status = 'idle';
   private message = '';
   private pendingLaunch: string | undefined;
-  private wantedPid: number | undefined;
+  private wantedKey: string | undefined;
   private viewport: { width: number; height: number } | undefined;
   private visible = true;
   private cornerRatio: number | null | undefined;
@@ -60,9 +75,9 @@ export class EmulatorViewController implements vscode.Disposable {
     private readonly registry: DeviceRegistry,
     private readonly log: vscode.LogOutputChannel,
     host: 'sidebar' | 'editor',
-    initialPid?: number,
+    initialKey?: string,
   ) {
-    this.wantedPid = initialPid;
+    this.wantedKey = initialKey;
     const media = vscode.Uri.joinPath(context.extensionUri, 'media');
     webview.options = { enableScripts: true, localResourceRoots: [media] };
     webview.html = renderHtml(webview, media, host);
@@ -77,10 +92,17 @@ export class EmulatorViewController implements vscode.Disposable {
     );
     controllers.add(this);
     lastActive = this;
+    registry.startAdbTracking();
   }
 
-  get connectedEmulator() {
-    return this.session?.emulator;
+  /** Key of the device this view shows, e.g. to open the same device in another panel. */
+  get connectedKey(): string | undefined {
+    return this.target?.key;
+  }
+
+  /** Emulators can be stopped from here; physical devices can't. */
+  get canStop(): boolean {
+    return !!this.target && (!!this.target.emulator || (!!this.target.serial && isEmulatorSerial(this.target.serial)));
   }
 
   toggleFullscreen(): void {
@@ -114,7 +136,7 @@ export class EmulatorViewController implements vscode.Disposable {
     if (!this.registry.ready && !this.session) {
       return { status: 'connecting', message: '' };
     }
-    if (!this.registry.sdkPath && !this.session && this.registry.running.length === 0) {
+    if (!this.registry.sdkPath && !this.session && this.registry.running.length === 0 && this.registry.adbDevices.length === 0) {
       return { status: 'noSdk', message: '' };
     }
     if (this.pendingLaunch && this.registry.isLaunching(this.pendingLaunch) && !this.session) {
@@ -130,8 +152,10 @@ export class EmulatorViewController implements vscode.Disposable {
       status,
       message,
       devices: this.registry.entries,
-      selectedKey: this.session ? `run:${this.session.emulator.pid}` : undefined,
-      deviceName: this.session?.emulator.avdName,
+      selectedKey: this.target?.key,
+      deviceName: this.target?.name,
+      deviceKind: this.target?.kind,
+      canStop: this.canStop,
       platform: process.platform,
       quality: vscode.workspace.getConfiguration('emulatorDock').get<string>('screenQuality', 'auto'),
       cornerRatio: this.session ? this.cornerRatio : undefined,
@@ -139,42 +163,102 @@ export class EmulatorViewController implements vscode.Disposable {
   }
 
   private onRegistryChange(): void {
-    if (this.session && !this.registry.running.some((r) => r.pid === this.session!.emulator.pid)) {
-      const name = this.session.emulator.avdName;
+    const target = this.target;
+    if (target?.kind === 'adb' && target.serial) {
+      // The device's display name arrives shortly after it connects.
+      target.name = this.registry.adbLabel(target.serial);
+    }
+    if (target && !this.registry.isAvailable(target.key)) {
+      const stopped = target.kind === 'emulator' || (target.serial && isEmulatorSerial(target.serial));
       this.disconnect();
-      this.setStatus('idle', `${name} was stopped.`);
+      this.setStatus('idle', `${target.name} was ${stopped ? 'stopped' : 'disconnected'}.`);
     }
     if (!this.session && this.status !== 'connecting') {
-      const running = this.registry.running;
-      const target =
-        (this.wantedPid !== undefined ? running.find((r) => r.pid === this.wantedPid) : undefined) ??
-        (this.pendingLaunch ? running.find((r) => r.avdId === this.pendingLaunch) : undefined) ??
-        (vscode.workspace.getConfiguration('emulatorDock').get<boolean>('autoConnect', true) && this.status !== 'error' ? running[0] : undefined);
-      if (target) {
-        void this.connect(target.pid);
+      const key = this.pickTarget();
+      if (key) {
+        void this.connect(key);
         return;
       }
     }
     this.sendState();
   }
 
+  /** The device to show when nothing is shown: the one from before a reload, a just-launched AVD, or any running emulator. */
+  private pickTarget(): string | undefined {
+    if (this.wantedKey) {
+      if (this.registry.isAvailable(this.wantedKey)) {
+        return this.wantedKey;
+      }
+      // After a reload, wait for adb's first device list before settling for another device.
+      if (this.wantedKey.startsWith('adb:') && !this.registry.adbSettled) {
+        return undefined;
+      }
+    }
+    const running = this.registry.running;
+    const launched = this.pendingLaunch ? running.find((r) => r.avdId === this.pendingLaunch) : undefined;
+    if (launched) {
+      return `run:${launched.pid}`;
+    }
+    // Physical devices are only shown on request: mirroring keeps the device busy.
+    if (vscode.workspace.getConfiguration('emulatorDock').get<boolean>('autoConnect', true) && this.status !== 'error' && running[0]) {
+      return `run:${running[0].pid}`;
+    }
+    return undefined;
+  }
+
   // ---- Connection ----------------------------------------------------------------
 
-  async connect(pid: number): Promise<void> {
-    const emulator = this.registry.running.find((r) => r.pid === pid);
-    if (!emulator || this.session?.emulator.pid === pid) {
+  private sink(tag: string): SessionSink {
+    return {
+      frame: (frame) => this.post({ type: 'frame', ...frame }),
+      screenOff: () => this.post({ type: 'screenOff' }),
+      log: (msg) => this.log.info(`[${tag}] ${msg}`),
+    };
+  }
+
+  private createSession(key: string): { session: DeviceSession; target: Target } | undefined {
+    if (key.startsWith('run:')) {
+      const emulator = this.registry.running.find((r) => r.pid === Number(key.slice(4)));
+      if (!emulator) {
+        return undefined;
+      }
+      return {
+        session: new EmulatorSession(emulator, protoPath(this.context), this.sink(emulator.avdId)),
+        target: {
+          key,
+          name: emulator.avdName,
+          kind: 'emulator',
+          serial: emulator.serialPort ? `emulator-${emulator.serialPort}` : undefined,
+          emulator,
+        },
+      };
+    }
+    const adb = this.registry.adbPath;
+    if (key.startsWith('adb:') && adb && this.registry.isAvailable(key)) {
+      const serial = key.slice(4);
+      return {
+        session: new AdbSession(adb, serial, this.sink(serial)),
+        target: { key, name: this.registry.adbLabel(serial), kind: 'adb', serial },
+      };
+    }
+    return undefined;
+  }
+
+  async connect(key: string): Promise<void> {
+    if (this.target?.key === key) {
+      return;
+    }
+    const created = this.createSession(key);
+    if (!created) {
       return;
     }
     this.disconnect();
     this.pendingLaunch = undefined;
-    this.wantedPid = undefined;
-    const session = new EmulatorSession(emulator, protoPath(this.context), {
-      frame: (frame) => this.post({ type: 'frame', ...frame }),
-      screenOff: () => this.post({ type: 'screenOff' }),
-      log: (msg) => this.log.info(`[${emulator.avdId}] ${msg}`),
-    });
+    this.wantedKey = undefined;
+    const { session, target } = created;
     this.session = session;
-    this.setStatus('connecting', emulator.avdName);
+    this.target = target;
+    this.setStatus('connecting', target.name);
     try {
       session.setActive(this.visible);
       await session.start();
@@ -185,50 +269,51 @@ export class EmulatorViewController implements vscode.Disposable {
         session.setViewport(this.viewport.width, this.viewport.height);
       }
       const { width, height } = session.displaySize;
-      this.log.info(`Connected to ${emulator.avdId} on gRPC port ${emulator.grpcPort} (display ${width}x${height})`);
+      const via = target.emulator ? `gRPC port ${target.emulator.grpcPort}` : `adb (${target.serial})`;
+      this.log.info(`Connected to ${target.name} over ${via} (display ${width}x${height})`);
       this.setStatus('connected');
-      void this.loadCornerRadius(session);
+      void this.loadCornerRadius(session, target);
     } catch (e) {
       if (this.session !== session) {
         return;
       }
       const err = e as Error & { details?: string };
-      this.log.error(`Could not connect to ${emulator.avdId}: ${err.details || err.message}`);
+      this.log.error(`Could not connect to ${target.name}: ${err.details || err.message}`);
       this.disconnect();
-      this.setStatus('error', `Couldn't connect to ${emulator.avdName}: ${err.details || err.message}`);
+      this.setStatus('error', `Couldn't connect to ${target.name}: ${err.details || err.message}`);
     }
   }
 
   private disconnect(): void {
     this.session?.dispose();
     this.session = undefined;
+    this.target = undefined;
     this.cornerRatio = undefined;
   }
 
   /** Asks Android for the screen's corner radius so the panel clips exactly where the device does. */
-  private async loadCornerRadius(session: EmulatorSession): Promise<void> {
-    const { pid, serialPort, avdId } = session.emulator;
-    const sdk = this.registry.sdkPath;
-    if (cornerRatios.has(pid)) {
-      this.cornerRatio = cornerRatios.get(pid);
+  private async loadCornerRadius(session: DeviceSession, target: Target): Promise<void> {
+    const adb = this.registry.adbPath;
+    if (cornerRatios.has(target.key)) {
+      this.cornerRatio = cornerRatios.get(target.key);
       this.sendState();
       return;
     }
-    if (!sdk || !serialPort) {
+    if (!adb || !target.serial) {
       return;
     }
     // A freshly launched device answers only once it has booted, so keep asking for a while.
     for (let attempt = 0; attempt < 45 && this.session === session; attempt++) {
-      const radius = await readCornerRadius(sdk, `emulator-${serialPort}`);
+      const radius = await readCornerRadius(adb, target.serial);
       if (this.session !== session) {
         return;
       }
       if (radius !== undefined) {
         const { width, height } = session.displaySize;
         const ratio = radius === null ? null : radius / Math.min(width, height);
-        cornerRatios.set(pid, ratio);
+        cornerRatios.set(target.key, ratio);
         this.cornerRatio = ratio;
-        this.log.info(`[${avdId}] screen corner radius: ${radius ?? 'none reported'}`);
+        this.log.info(`[${target.serial}] screen corner radius: ${radius ?? 'none reported'}`);
         this.sendState();
         return;
       }
@@ -240,7 +325,7 @@ export class EmulatorViewController implements vscode.Disposable {
     lastActive = this;
     const running = this.registry.running.find((r) => r.avdId === avdId);
     if (running) {
-      await this.connect(running.pid);
+      await this.connect(`run:${running.pid}`);
       return;
     }
     this.disconnect();
@@ -257,24 +342,31 @@ export class EmulatorViewController implements vscode.Disposable {
   }
 
   async stop(): Promise<void> {
-    const emulator = this.session?.emulator;
-    if (emulator) {
-      this.setStatus('connecting', `Stopping ${emulator.avdName}…`);
-      await this.registry.stop(emulator);
+    const target = this.target;
+    if (!target || !this.canStop) {
+      return;
+    }
+    this.setStatus('connecting', `Stopping ${target.name}…`);
+    if (target.emulator) {
+      await this.registry.stop(target.emulator);
+    } else if (target.serial) {
+      await this.registry.stopAdbEmulator(target.serial);
     }
   }
 
   async screenshot(): Promise<void> {
     const session = this.session;
-    if (!session) {
-      void vscode.window.showWarningMessage('No emulator is connected.');
+    const device = this.target;
+    if (!session || !device) {
+      void vscode.window.showWarningMessage('No device is connected.');
       return;
     }
     const png = await session.screenshotPng();
     const stamp = new Date().toISOString().replace(/[:T]/g, '-').replace(/\..+/, '');
     const folder = vscode.workspace.workspaceFolders?.[0]?.uri ?? vscode.Uri.file(os.homedir());
+    const stem = (device.emulator?.avdId ?? device.name).replace(/[^\w.-]+/g, '_');
     const target = await vscode.window.showSaveDialog({
-      defaultUri: vscode.Uri.joinPath(folder, `${session.emulator.avdId}-${stamp}.png`),
+      defaultUri: vscode.Uri.joinPath(folder, `${stem}-${stamp}.png`),
       filters: { 'PNG image': ['png'] },
       title: 'Save emulator screenshot',
     });
@@ -361,8 +453,8 @@ export class EmulatorViewController implements vscode.Disposable {
           break;
         case 'select':
           lastActive = this;
-          if (typeof m.key === 'string' && m.key.startsWith('run:')) {
-            await this.connect(Number(m.key.slice(4)));
+          if (typeof m.key === 'string' && (m.key.startsWith('run:') || m.key.startsWith('adb:'))) {
+            await this.connect(m.key);
           } else if (typeof m.key === 'string' && m.key.startsWith('avd:')) {
             await this.launch(m.key.slice(4));
           }

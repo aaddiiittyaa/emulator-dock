@@ -18,7 +18,10 @@
     "avd",
     "flutter",
     "react native",
-    "mobile"
+    "mobile",
+    "adb",
+    "physical device",
+    "screen mirroring"
   ],
   "icon": "media/icon.png",
   "extensionKind": [
